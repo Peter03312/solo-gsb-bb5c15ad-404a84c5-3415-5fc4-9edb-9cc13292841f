@@ -106,6 +106,9 @@ CREATE TABLE IF NOT EXISTS measurements (
     replaces_measurement_id BIGINT REFERENCES measurements(id),
     replaced_by_id          BIGINT REFERENCES measurements(id),
     correction_reason       TEXT,
+    -- 分段实测 CSV 批次溯源（单条录入/纠错为 NULL；批次确认生成的实测回填）
+    batch_id        BIGINT,
+    batch_row_no    INTEGER,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_meas_exhibit_status ON measurements (exhibit_id, status);
@@ -116,6 +119,46 @@ CREATE INDEX IF NOT EXISTS idx_meas_replaces ON measurements (replaces_measureme
 ALTER TABLE measurements ADD COLUMN IF NOT EXISTS replaces_measurement_id BIGINT;
 ALTER TABLE measurements ADD COLUMN IF NOT EXISTS replaced_by_id BIGINT;
 ALTER TABLE measurements ADD COLUMN IF NOT EXISTS correction_reason TEXT;
+-- 既有库升级：补齐 CSV 批次溯源列。
+ALTER TABLE measurements ADD COLUMN IF NOT EXISTS batch_id BIGINT;
+ALTER TABLE measurements ADD COLUMN IF NOT EXISTS batch_row_no INTEGER;
+
+-- 分段实测 CSV 导入批次（规则 18）：保管员把某条已批准（或待复核）计划的分段实测 CSV
+-- 导入为待确认批次（pending）。导入/预览逐行校验：正时长、正照度、完整落在计划开灯窗内；
+-- 行间互不相交，且不与同展品未作废实测（含草稿）、停灯、照明事故、其他待确认批次行相交；
+-- 任一错误整批不保存。待确认批次不计量、不参与既有占用计算。
+-- 确认时在展品锁事务内重新校验批次与实时占用，全部有效才原子生成已确认实测
+-- （写入 measurements 并经 batch_id/batch_row_no 回联），确认结果快照存 confirm_result，
+-- 重复确认原样返回（幂等）；确认导致超限仍入账，按既有规则转待复核。
+CREATE TABLE IF NOT EXISTS measurement_batches (
+    id              BIGSERIAL PRIMARY KEY,
+    plan_id         BIGINT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+    exhibit_id      BIGINT NOT NULL REFERENCES exhibits(id) ON DELETE CASCADE,
+    status          TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending','confirmed')),
+    row_count       INTEGER NOT NULL CHECK (row_count > 0),
+    source_name     TEXT,
+    confirm_result  JSONB,
+    created_by      BIGINT REFERENCES users(id),
+    confirmed_by    BIGINT REFERENCES users(id),
+    confirmed_at    TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_meas_batch_exhibit ON measurement_batches (exhibit_id, status);
+CREATE INDEX IF NOT EXISTS idx_meas_batch_plan ON measurement_batches (plan_id, id);
+
+-- 批次逐行（行号按 CSV 数据行从 1 开始，不含表头与空行）；确认后 measurement_id 回联生成的实测。
+CREATE TABLE IF NOT EXISTS measurement_batch_rows (
+    id              BIGSERIAL PRIMARY KEY,
+    batch_id        BIGINT NOT NULL REFERENCES measurement_batches(id) ON DELETE CASCADE,
+    row_no          INTEGER NOT NULL,
+    start_ts        TIMESTAMPTZ NOT NULL,
+    end_ts          TIMESTAMPTZ NOT NULL CHECK (end_ts > start_ts),
+    actual_lux      NUMERIC(10,2) NOT NULL CHECK (actual_lux > 0),
+    measurement_id  BIGINT REFERENCES measurements(id),
+    UNIQUE (batch_id, row_no)
+);
+CREATE INDEX IF NOT EXISTS idx_meas_batch_rows_batch ON measurement_batch_rows (batch_id, row_no);
 
 -- 停灯记录：保管员对已批准/待复核计划登记“已发生”的停灯时段（必填原因）。
 -- 停灯时段只从所属计划“未被已确认实测覆盖”的估算时段中扣减剂量（按墙上自然年拆分），

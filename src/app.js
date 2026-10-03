@@ -13,6 +13,7 @@ const exhibitRoutes = require('./routes/exhibits');
 const planRoutes = require('./routes/plans');
 const adjustmentRoutes = require('./routes/adjustments');
 const measurementRoutes = require('./routes/measurements');
+const measurementBatchRoutes = require('./routes/measurement-batches');
 const blackoutRoutes = require('./routes/blackouts');
 const incidentRoutes = require('./routes/incidents');
 const ledgerRoutes = require('./routes/ledgers');
@@ -32,6 +33,8 @@ function createApp() {
   app.use('/api/plans', planRoutes);
   app.use('/api/adjustments', adjustmentRoutes);
   app.use('/api/measurements', measurementRoutes);
+  app.use('/api/plans/:id/measurement-batches', measurementBatchRoutes.planRouter);
+  app.use('/api/measurement-batches', measurementBatchRoutes.router);
   app.use('/api/blackouts', blackoutRoutes.router);
   app.use('/api/incidents', incidentRoutes.router);
   app.use('/api/exhibits/:id/ledgers', ledgerRoutes);

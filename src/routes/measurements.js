@@ -444,3 +444,6 @@ router.delete('/:id', requireRole('conservator'), async (req, res, next) => {
 });
 
 module.exports = router;
+// 供 CSV 批次确认复用（同一超限判定与转待复核口径）
+module.exports.flagPlansForOverflow = flagPlansForOverflow;
+module.exports.overflowInfoFromOccupancy = overflowInfoFromOccupancy;

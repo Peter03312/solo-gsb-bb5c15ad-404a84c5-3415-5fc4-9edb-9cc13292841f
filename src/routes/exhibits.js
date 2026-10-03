@@ -38,6 +38,9 @@ function serializeMeasurement(m) {
     annulledAt: m.annulled_at || null,
     confirmedBy: m.confirmed_by != null ? Number(m.confirmed_by) : null,
     confirmedAt: m.confirmed_at || null,
+    // CSV 批次溯源（单条录入/纠错为 null，既有消费者不受影响）
+    batchId: m.batch_id != null ? Number(m.batch_id) : null,
+    batchRowNo: m.batch_row_no != null ? Number(m.batch_row_no) : null,
     planTitle: m.plan_title != null ? m.plan_title : (m.planTitle || null),
   };
 }

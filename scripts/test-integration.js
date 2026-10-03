@@ -15,7 +15,10 @@
  *                 自然年重算、纠错超额转待复核、占用下降不恢复待复核、链式纠错、取消计划后纠错）、
  *       计划外照明事故（登记校验/三类相交冲突一次性指出且不保存、窗内替代估算/窗外单独计量/不释放排期、
  *                 跨年拆分、后续实测/停灯/纠错互斥、超额仍生效转待复核、已开始计划不转、
- *                 下调预演指纹含事故、已封存账册不回写与新增来源对照、调整口径、不可改删/越权）。
+ *                 下调预演指纹含事故、已封存账册不回写与新增来源对照、调整口径、不可改删/越权）、
+ *       分段实测 CSV 导入批次（预演逐行按年剂量与整批预计占用不写库、行错误列行号整批不保存、
+ *                 待确认不计量、确认前复核失败保持待确认、确认原子生成已确认实测并替代估算、
+ *                 重复确认幂等返回原结果、超限仍入账并转待复核、跨年拆分、账册兼容）。
  */
 
 process.env.SEED_DEMO = 'false';
@@ -2473,6 +2476,255 @@ async function runFlow() {
   r = await call('GET', `/api/exhibits/${exIn7}`, null, 'i');
   assert(r.body.years[2024].used === 500 && r.body.years[2030].used === 800,
     '事故 500 始终计入 2024 实际用光，2030 计划残余不变');
+
+  // ==================== 分段实测 CSV 导入批次 ====================
+  // 场景：已批准计划 2026-06-01~06-03，每日 09-12 / 13-17（7h/天），100 lx -> 2100 lx·h
+  const exB = await createExhibit('CSV 批次展品');
+  await call('POST', `/api/exhibits/${exB}/limits`, { year: 2026, limitLxh: 10000 }, 'c');
+  const planCsv = await submitPlan(exB, '批次计划', '2026-06-01', '2026-06-03',
+    ['09:00-12:00', '13:00-17:00'], 100);
+  await approvePlan(planCsv);
+
+  // ---- 预演：逐行按年剂量 + 整批预计占用，不写库 ----
+  const csvOk = 'start,end,lux\r\n2026-06-01 09:00,2026-06-01 10:00,120\r\n2026-06-01 14:00,2026-06-01 16:00,110\r\n';
+  r = await call('POST', `/api/plans/${planCsv}/measurement-batches/preview`, { csv: csvOk }, 'c');
+  assert(r.status === 200 && r.body.preview.rowCount === 2, 'CSV 预演成功（2 行）');
+  assert(r.body.preview.rows[0].yearly['2026'] === 120 &&
+    r.body.preview.rows[1].yearly['2026'] === 220, '预演逐行按年剂量（120 / 220）');
+  assert(r.body.preview.batchYearly['2026'] === 340, '预演整批按年剂量 340');
+  const prevOcc = r.body.preview.occupancy['2026'];
+  assert(prevOcc.limit === 10000 && prevOcc.usedBefore === 2100 && prevOcc.batchDose === 340 &&
+    prevOcc.projected === 2140 && prevOcc.remainingAfter === 7860 && prevOcc.excess === null,
+    `整批预计占用（2100 - 300 估算 + 340 实测 = 2140，实际=${JSON.stringify(prevOcc)}）`);
+  // 预演不写库：批次列表为空、额度不变
+  r = await call('GET', `/api/plans/${planCsv}/measurement-batches`, null, 'i');
+  assert(r.status === 200 && r.body.batches.length === 0, '预演不保存批次');
+  r = await call('GET', `/api/exhibits/${exB}`, null, 'i');
+  assert(r.body.years['2026'].used === 2100 && r.body.measurements.length === 0,
+    '预演不改变额度与实测');
+
+  // ---- 预演/导入的行错误：列出行号与原因，整批不保存 ----
+  const csvBad = [
+    '2026-06-01 08:00,2026-06-01 10:00,100',   // 行1：越出开灯窗（09 点前开始）
+    '2026-06-01 10:00,2026-06-01 10:00,100',   // 行2：零时长
+    '2026-06-01 10:00,2026-06-01 11:00,-5',    // 行3：非正照度
+    '2026-06-01 14:00,2026-06-01 15:00,100',   // 行4：与行5相交
+    '2026-06-01 14:30,2026-06-01 16:00,100',   // 行5：与行4相交
+    'not-a-time,2026-06-01 11:00,100',          // 行6：非法开始时间
+  ].join('\n');
+  r = await call('POST', `/api/plans/${planCsv}/measurement-batches/preview`, { csv: csvBad }, 'c');
+  assert(r.status === 400 && Array.isArray(r.body.details.rowErrors), 'CSV 行错误返回 400 + rowErrors');
+  const errRows = r.body.details.rowErrors.map((e) => e.row);
+  assert(JSON.stringify(errRows) === JSON.stringify([1, 2, 3, 4, 5, 6]),
+    `逐行列出错误行号（实际=${JSON.stringify(errRows)}）`);
+  assert(/开灯窗/.test(r.body.details.rowErrors[0].reason), '行1 原因：越出开灯窗');
+  assert(/晚于开始/.test(r.body.details.rowErrors[1].reason), '行2 原因：零时长');
+  assert(/正数/.test(r.body.details.rowErrors[2].reason), '行3 原因：非正照度');
+  assert(/第 5 行/.test(r.body.details.rowErrors[3].reason), '行4 原因：与第 5 行相交');
+  assert(/开始时间无效/.test(r.body.details.rowErrors[5].reason), '行6 原因：非法开始时间');
+  r = await call('POST', `/api/plans/${planCsv}/measurement-batches`, { csv: csvBad }, 'c');
+  assert(r.status === 400 && r.body.details.rowErrors.length === 6, '导入有错误行：整批不保存');
+  r = await call('GET', `/api/plans/${planCsv}/measurement-batches`, null, 'c');
+  assert(r.body.batches.length === 0, '错误导入后无批次保存');
+
+  // ---- 角色与计划状态校验 ----
+  r = await call('POST', `/api/plans/${planCsv}/measurement-batches`, { csv: csvOk }, 'i');
+  assert(r.status === 403, '布展员不能导入批次');
+  r = await call('POST', `/api/plans/${planCsv}/measurement-batches/preview`, { csv: csvOk }, 'i');
+  assert(r.status === 403, '布展员不能预演批次');
+  const planDraft = await submitPlan(exB, '未批准计划', '2026-07-01', '2026-07-01',
+    ['09:00-10:00'], 100);
+  r = await call('POST', `/api/plans/${planDraft}/measurement-batches`,
+    { csv: '2026-07-01 09:00,2026-07-01 09:30,100' }, 'c');
+  assert(r.status === 400 && /已批准/.test(r.body.error), '未批准计划不能导入批次');
+
+  // ---- 导入为待确认批次：不计量 ----
+  r = await call('POST', `/api/plans/${planCsv}/measurement-batches`,
+    { csv: csvOk, sourceName: 'june.csv' }, 'c');
+  assert(r.status === 201 && r.body.batch.status === 'pending' && r.body.batch.rowCount === 2,
+    '导入生成待确认批次');
+  const batch1 = r.body.batch.id;
+  assert(r.body.batch.sourceName === 'june.csv' && r.body.batch.rows.length === 2 &&
+    r.body.batch.rows[0].yearly['2026'] === 120, '批次逐行按年剂量');
+  assert(r.body.preview.batchYearly['2026'] === 340, '导入响应附整批预计占用');
+  r = await call('GET', `/api/exhibits/${exB}`, null, 'i');
+  assert(r.body.years['2026'].used === 2100 && r.body.measurements.length === 0,
+    '待确认批次不计量（占用与实测不变）');
+
+  // ---- 待确认批次行参与相交判定：导入与其相交的新批次被拒 ----
+  r = await call('POST', `/api/plans/${planCsv}/measurement-batches`,
+    { csv: '2026-06-01 09:30,2026-06-01 10:30,100' }, 'c');
+  assert(r.status === 400 && /待确认批次/.test(r.body.details.rowErrors[0].reason),
+    '与待确认批次行相交的导入被拒');
+
+  // ---- 批次详情（登录可读）----
+  r = await call('GET', `/api/measurement-batches/${batch1}`, null, 'i');
+  assert(r.status === 200 && r.body.batch.rows.length === 2 &&
+    r.body.batch.rows[0].measurementId === null, '批次详情含逐行（未确认无实测编号）');
+
+  // ---- 确认前复核：导入后新增停灯与批次行相交 -> 确认失败，保持待确认且不计量 ----
+  r = await call('POST', '/api/blackouts', {
+    planId: planCsv, startDate: '2026-06-01', startTime: '09:30',
+    endDate: '2026-06-01', endTime: '10:30', reason: '设备检修',
+  }, 'c');
+  assert(r.status === 201, '登记与批次行相交的停灯（停灯登记不看待确认批次）');
+  r = await call('POST', `/api/measurement-batches/${batch1}/confirm`, {}, 'c');
+  assert(r.status === 409 && r.body.details.rowErrors.length === 1 &&
+    /停灯记录/.test(r.body.details.rowErrors[0].reason),
+    '确认前复核发现停灯相交：409 列出行号与原因');
+  r = await call('GET', `/api/measurement-batches/${batch1}`, null, 'c');
+  assert(r.body.batch.status === 'pending', '校验失败批次保持待确认');
+  r = await call('GET', `/api/exhibits/${exB}`, null, 'i');
+  assert(r.body.measurements.length === 0 && r.body.years['2026'].used === 2000,
+    '确认失败不计量（占用 2100 - 停灯 100 = 2000，无实测生成）');
+
+  // ---- 删除待确认批次后可重新导入 ----
+  r = await call('DELETE', `/api/measurement-batches/${batch1}`, null, 'i');
+  assert(r.status === 403, '布展员不能删除批次');
+  r = await call('DELETE', `/api/measurement-batches/${batch1}`, null, 'c');
+  assert(r.status === 200, '保管员删除待确认批次');
+  r = await call('GET', `/api/plans/${planCsv}/measurement-batches`, null, 'c');
+  assert(r.body.batches.length === 0, '删除后批次列表为空');
+
+  // ---- 确认成功：原子生成已确认实测，实测替代估算 ----
+  const exB2 = await createExhibit('CSV 批次确认展品');
+  await call('POST', `/api/exhibits/${exB2}/limits`, { year: 2026, limitLxh: 10000 }, 'c');
+  const planB2 = await submitPlan(exB2, '确认计划', '2026-06-01', '2026-06-02',
+    ['09:00-17:00'], 100); // 8h/天 × 2 天 × 100 = 1600
+  await approvePlan(planB2);
+  const csvB2 = '2026-06-01 09:00,2026-06-01 11:00,150\n2026-06-01 15:00,2026-06-01 17:00,100';
+  r = await call('POST', `/api/plans/${planB2}/measurement-batches`, { csv: csvB2 }, 'c');
+  assert(r.status === 201, '导入确认用批次');
+  const batch2 = r.body.batch.id;
+  r = await call('POST', `/api/measurement-batches/${batch2}/confirm`, {}, 'c');
+  assert(r.status === 200 && r.body.batch.status === 'confirmed', '确认批次成功');
+  assert(r.body.result.rowCount === 2 && r.body.result.measurements.length === 2 &&
+    r.body.result.batchYearly['2026'] === 500, '批次结果含逐条实测与整批剂量 500');
+  const measIds = r.body.result.measurements.map((m) => m.id);
+  assert(r.body.batch.rows.every((row) => row.measurementId !== null), '批次行回联实测编号');
+  r = await call('GET', `/api/exhibits/${exB2}`, null, 'i');
+  assert(r.body.measurements.length === 2 &&
+    r.body.measurements.every((m) => m.status === 'confirmed' && m.batchId === batch2),
+    '生成 2 条已确认实测（batchId 溯源）');
+  assert(r.body.measurements.map((m) => m.batchRowNo).sort().join(',') === '1,2',
+    '实测带批次行号');
+  assert(r.body.years['2026'].used === 1700,
+    `实测替代估算（1600 - 400 + 500 = 1700，实际=${r.body.years['2026'].used}）`);
+  // 重复确认：返回原批次结果，不重复生成实测
+  r = await call('POST', `/api/measurement-batches/${batch2}/confirm`, {}, 'c');
+  assert(r.status === 200 && r.body.alreadyConfirmed === true &&
+    r.body.result.measurements.map((m) => m.id).join(',') === measIds.join(','),
+    '重复确认返回原批次结果');
+  r = await call('GET', `/api/exhibits/${exB2}`, null, 'i');
+  assert(r.body.measurements.length === 2 && r.body.years['2026'].used === 1700,
+    '重复确认不重复入账');
+  // 已确认批次不可删除
+  r = await call('DELETE', `/api/measurement-batches/${batch2}`, null, 'c');
+  assert(r.status === 400, '已确认批次不可删除');
+  // 审计含批次导入与确认
+  r = await call('GET', '/api/audit?limit=1000', null, 'c');
+  assert(r.body.events.filter((e) => e.action === 'measurement_batch.import').length >= 1 &&
+    r.body.events.filter((e) => e.action === 'measurement_batch.confirm').length === 1,
+    '审计含批次导入/确认（确认仅一次）');
+
+  // ---- 跨年行按自然年拆分 ----
+  const exB3 = await createExhibit('CSV 跨年批次展品');
+  await call('POST', `/api/exhibits/${exB3}/limits`, { year: 2026, limitLxh: 10000 }, 'c');
+  await call('POST', `/api/exhibits/${exB3}/limits`, { year: 2027, limitLxh: 10000 }, 'c');
+  const planB3 = await submitPlan(exB3, '跨年夜场', '2026-12-31', '2026-12-31',
+    ['20:00-02:00'], 100); // 窗 2026-12-31 20:00 ~ 2027-01-01 02:00
+  await approvePlan(planB3);
+  r = await call('POST', `/api/plans/${planB3}/measurement-batches/preview`,
+    { csv: '2026-12-31 22:00,2027-01-01 01:00,100' }, 'c');
+  assert(r.status === 200 && r.body.preview.rows[0].yearly['2026'] === 200 &&
+    r.body.preview.rows[0].yearly['2027'] === 100, '跨年行按自然年拆分（2026:200 / 2027:100）');
+  assert(r.body.preview.occupancy['2026'].batchDose === 200 &&
+    r.body.preview.occupancy['2027'].batchDose === 100, '整批预计占用按年分列');
+
+  // ---- 确认导致超限仍入账：列出超额年份并转待复核 ----
+  const exB4 = await createExhibit('CSV 超限批次展品');
+  await call('POST', `/api/exhibits/${exB4}/limits`, { year: 2026, limitLxh: 1000 }, 'c');
+  const planB4 = await submitPlan(exB4, '实测超限计划', '2026-06-01', '2026-06-01',
+    ['09:00-17:00'], 100); // 800
+  await approvePlan(planB4);
+  const planB4Future = await submitPlan(exB4, '未开始计划', '2026-12-01', '2026-12-01',
+    ['09:00-10:00'], 100); // 100，合计 900 ≤ 1000
+  await approvePlan(planB4Future);
+  r = await call('POST', `/api/plans/${planB4}/measurement-batches`,
+    { csv: '2026-06-01 09:00,2026-06-01 17:00,150' }, 'c'); // 8h × 150 = 1200
+  assert(r.status === 201, '超限场景批次导入');
+  const batch4 = r.body.batch.id;
+  r = await call('POST', `/api/measurement-batches/${batch4}/confirm`, {}, 'c');
+  assert(r.status === 409 && r.body.overflows.length === 1 &&
+    r.body.overflows[0].year === 2026 && r.body.overflows[0].excess === 300,
+    `确认超限仍入账（409，超额 300，实际=${JSON.stringify(r.body.overflows || null)}）`);
+  assert(r.body.flaggedPlans.length === 1 && r.body.flaggedPlans[0].id === planB4Future,
+    '相关年度未开始计划转待复核');
+  r = await call('GET', `/api/exhibits/${exB4}`, null, 'i');
+  assert(r.body.years['2026'].used === 1300 &&
+    r.body.measurements.length === 1 && r.body.measurements[0].status === 'confirmed',
+    '超限批次实测已入账（1200 + 100 = 1300）');
+  assert(r.body.plans.find((p) => p.id === planB4Future).status === 'pending_review',
+    '未开始计划已转待复核');
+  // 重复确认返回原批次结果（含原超额），不重复转复核
+  r = await call('POST', `/api/measurement-batches/${batch4}/confirm`, {}, 'c');
+  assert(r.status === 200 && r.body.alreadyConfirmed === true &&
+    r.body.result.overflows.length === 1 && r.body.result.overflows[0].excess === 300,
+    '重复确认返回原超额结果');
+  r = await call('GET', '/api/audit?limit=1000', null, 'c');
+  assert(r.body.events.filter((e) => e.action === 'measurement_batch.confirm').length === 2,
+    '批次确认审计不重复（仍各一次）');
+
+  // ---- 与既有实测/事故相交的批次行 ----
+  const exB5 = await createExhibit('CSV 相交判定展品');
+  await call('POST', `/api/exhibits/${exB5}/limits`, { year: 2024, limitLxh: 50000 }, 'c');
+  const planB5 = await submitPlan(exB5, '相交计划', '2024-05-01', '2024-05-02',
+    ['09:00-17:00'], 100);
+  await approvePlan(planB5);
+  r = await call('POST', '/api/measurements', {
+    planId: planB5, startDate: '2024-05-01', startTime: '10:00',
+    endDate: '2024-05-01', endTime: '11:00', actualLux: 100,
+  }, 'c');
+  const measB5 = r.body.measurement.id;
+  r = await call('POST', `/api/measurements/${measB5}/confirm`, {}, 'c');
+  assert(r.status === 200, '既有已确认实测 10:00-11:00');
+  r = await call('POST', '/api/incidents', {
+    exhibitId: exB5, startDate: '2024-05-01', startTime: '14:00',
+    endDate: '2024-05-01', endTime: '15:00', actualLux: 200, reason: '相交测试事故',
+  }, 'c');
+  assert(r.status === 201, '既有照明事故 14:00-15:00');
+  r = await call('POST', `/api/plans/${planB5}/measurement-batches`, {
+    csv: [
+      '2024-05-01 09:30,2024-05-01 10:30,100',  // 行1：与已确认实测相交
+      '2024-05-01 14:30,2024-05-01 15:30,100',  // 行2：与事故相交
+      '2024-05-02 09:00,2024-05-02 10:00,100',  // 行3：有效
+    ].join('\n'),
+  }, 'c');
+  assert(r.status === 400 && r.body.details.rowErrors.length === 2 &&
+    /已确认实测/.test(r.body.details.rowErrors[0].reason) &&
+    /照明事故/.test(r.body.details.rowErrors[1].reason),
+    '与已确认实测/事故相交的行被拒（整批不保存）');
+
+  // ---- 封存账册兼容：批次确认的实测作为 measurement 来源入账 ----
+  const exB6 = await createExhibit('CSV 账册展品');
+  await call('POST', `/api/exhibits/${exB6}/limits`, { year: 2024, limitLxh: 5000 }, 'c');
+  const planB6 = await submitPlan(exB6, '账册批次计划', '2024-05-01', '2024-05-01',
+    ['09:00-17:00'], 100); // 800
+  await approvePlan(planB6);
+  r = await call('POST', `/api/plans/${planB6}/measurement-batches`,
+    { csv: '2024-05-01 09:00,2024-05-01 10:00,200' }, 'c');
+  const batch6 = r.body.batch.id;
+  r = await call('POST', `/api/measurement-batches/${batch6}/confirm`, {}, 'c');
+  assert(r.status === 200, '账册展品批次确认');
+  r = await call('POST', `/api/exhibits/${exB6}/ledgers`, { year: 2024 }, 'c');
+  assert(r.status === 201 && r.body.ledger.confirmedTotal === 200 &&
+    r.body.ledger.residueTotal === 700 && r.body.ledger.total === 900,
+    `封存账册含批次实测（实测 200 + 残余 700 = 900，实际=${JSON.stringify({
+      c: r.body.ledger.confirmedTotal, r: r.body.ledger.residueTotal, t: r.body.ledger.total })}）`);
+  const measItem = r.body.ledger.items.find((it) => it.kind === 'measurement');
+  assert(measItem && measItem.yearDose === 200 &&
+    r.body.ledger.items.find((it) => it.kind === 'plan').yearDose === 700,
+    '账册逐项来源：批次实测 measurement:ID（200）+ 计划残余（700）');
 }
 
 main().catch((err) => {

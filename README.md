@@ -130,6 +130,23 @@ Node.js（Express）+ PostgreSQL，本地账号区分两类角色：
     - 事故**永久保留，不可修改、不可删除**（`PUT/DELETE` 返回 400）；**已封存账册不回写**，
       事故在账册对照中作为封存后新增来源（`incident:ID`）出现；既有响应字段保持兼容
       （展品详情仅附加 `incidents` / `incidentDoseYearly`，占用来源仅附加 `kind:'incident'`）。
+18. **分段实测 CSV 导入批次（conservator only）**：保管员可把某条**已批准（或待复核）计划**的
+    分段实测 CSV（每行：`开始时间,结束时间,实际照度`，墙上时间，可跨日跨年）先**预演**再**导入为待确认批次**。
+    - **预演不改任何状态**：逐行返回按自然年剂量，并按“确认后口径”给出**整批预计占用**
+      （批次各行作为已确认实测替代对应估算残余后，逐受影响年份的 上限/当前占用/本批剂量/
+      预计占用/剩余/超额）。
+    - **逐行校验，任一错误整批不保存**（400，`details.rowErrors` 列出行号与原因）：正时长、
+      正照度、完整落在该计划开灯窗内；行间互不相交；不与同展品**未作废实测（含草稿）**、
+      **停灯**、**照明事故**、**其他待确认批次行**相交。
+    - **待确认批次不计量**（不改变任何额度占用）；保管员可删除待确认批次后重新导入。
+    - **确认**时在**展品锁事务**内重新校验批次与实时占用：全部有效才**原子生成已确认实测**
+      （写入 `measurements` 并经 `batchId`/`batchRowNo` 回联批次行）并记录批次审计
+      （`measurement_batch.confirm`）；任一校验失败**保持待确认且不计量**（409 列出行号与原因）；
+      **重复确认返回原批次结果**（`alreadyConfirmed: true`，不重复入账、不重复转复核）。
+    - **确认导致超限仍入账**：返回 409 列出超额年份，并按既有规则把相关年度**尚未开始且有
+      估算残余**的已批准计划转**待复核**（原因注明由实测批次触发）。
+    - 既有单条实测、年度占用与封存账册对照的字段与口径保持兼容：批次确认的实测就是普通
+      已确认实测（账册来源仍为 `measurement:ID`），实测序列化仅附加 `batchId`/`batchRowNo`。
 
 ## 一键启动（Docker Compose）
 
@@ -241,8 +258,15 @@ npm run test:utils
     计量，不释放排期）。若因此超限，**事故仍生效**，相关年度仍有估算残余且尚未开始的已批准计划自动转
     待复核（已开始计划不转，超额红色显示）。事故永久保留、不可改删；已封存账册原样保留，事故在账册
     对照中作为封存后新增来源列出。
+14. 展后若实测数据是分段的 CSV 文件（每行 `开始时间,结束时间,实际照度`），保管员可对该已批准计划
+    调 `POST /api/plans/:id/measurement-batches/preview` 先**预演**（逐行按年剂量 + 整批预计占用，
+    不写库），确认无误后 `POST /api/plans/:id/measurement-batches` **导入为待确认批次**
+    （任一行有错则整批不保存，返回行号与原因）；待确认批次不计量。随后
+    `POST /api/measurement-batches/:id/confirm` **确认**：系统在展品锁内重新校验全部行与实时占用，
+    全部有效才原子生成已确认实测（实测替代估算）；确认失败批次保持待确认，可删除后重新导入；
+    重复确认返回原批次结果；确认导致超限仍入账并把相关未开始计划转待复核。
 
-## HTTP API（含计划调整申请、成对核准、**联合核准**、年度上限下调预演、停灯登记、**计划外照明事故**、**实测纠错**、**年度账册封存**）
+## HTTP API（含计划调整申请、成对核准、**联合核准**、年度上限下调预演、停灯登记、**计划外照明事故**、**实测纠错**、**年度账册封存**、**分段实测 CSV 导入批次**）
 
 所有接口除 `/api/health`、`/api/auth/login` 外都需要登录会话（HttpOnly Cookie `lqsession`）。
 统一错误形态：`{ "error": "中文原因", "details": { ... } }`，409 用于冲突（重叠/超额/重复申请）。
@@ -282,6 +306,9 @@ curl -b cookies.txt -X POST http://localhost:3000/api/auth/logout
 | `POST /api/plans/:id/cancel` | 登录 | 取消（布展员仅自己未批准的；保管员均可） |
 | `GET/POST /api/measurements`、`POST /api/measurements/:id/confirm`、`DELETE /api/measurements/:id` | 保管员 | 实测录入/确认/删草稿 |
 | `POST /api/measurements/:id/correct` | 保管员 | **实测纠错**：原记录作废保留 + 替代记录确认，按自然年重算；超额 409 并转待复核 |
+| `POST /api/plans/:id/measurement-batches/preview` | 保管员 | **CSV 批次预演**：逐行按年剂量 + 整批预计占用，不写库 |
+| `POST /api/plans/:id/measurement-batches`、`GET /api/plans/:id/measurement-batches` | 保管员导入 / 登录可读 | **导入 CSV 为待确认批次**（任一行错误整批不保存）/ 该计划批次列表 |
+| `GET /api/measurement-batches/:id`、`POST /api/measurement-batches/:id/confirm`、`DELETE /api/measurement-batches/:id` | 登录可读 / 保管员 | 批次详情 / **确认批次**（锁内重核，原子生成已确认实测；重复确认返回原结果）/ 删除待确认批次 |
 | `GET /api/blackouts?exhibitId=&planId=` | 登录 | 停灯记录列表（布展员只读），逐条附 `yearly` 按年扣减量；另返回 `blackoutDeductionByExhibit` |
 | `POST /api/blackouts` | 保管员 | 登记已发生停灯时段；成功响应为展品详情（另附 `blackout`）；冲突 409 不保存 |
 | `GET /api/incidents?exhibitId=&planId=` | 登录 | **计划外照明事故**列表（登录可读，`planId` 过滤与该计划当前开灯窗相交的事故），逐条附按年实际用光及窗内/窗外拆分 |
@@ -934,6 +961,100 @@ curl -b cookies-custodian.txt -X POST http://localhost:3000/api/measurements/31/
 审计写入一条 `measurement.correct`（target 为替代记录，detail 含原/替代编号、原因、前后时段照度
 与按年剂量、超额年份）；由纠错触发的计划转待复核写 `plan.flag_review`，原因中注明实测纠错。
 
+### 分段实测 CSV 导入批次 `/api/plans/:id/measurement-batches`、`/api/measurement-batches/:id`（保管员导入/确认，登录可读）
+
+保管员把某条**已批准（或待复核）计划**的分段实测 CSV 先**预演**、再**导入为待确认批次**、
+最后**确认**原子入账。CSV 每行 3 列：`开始时间,结束时间,实际照度`（墙上时间，
+`YYYY-MM-DD HH:MM` 或 `YYYY-MM-DDTHH:MM`，可带 `:SS` 秒，可跨日跨年）；支持 `\r\n`/`\n`、
+空行跳过、UTF-8 BOM、可选表头行（首列名为 `start`/`开始`/`开始时间` 等）；单批最多 1000 行。
+**行号按数据行从 1 开始（不含表头与空行）**。请求体均为 JSON：`{ "csv": "…", "sourceName": "可选文件名" }`。
+
+逐行校验规则（预演与导入同一套，**任一错误整批不保存**，400 且 `details.rowErrors` 列出全部
+行号与原因）：正时长、正照度、完整落在该计划开灯窗内；行间互不相交；不与同展品
+**未作废实测（含草稿）、停灯、照明事故、其他待确认批次行**相交。
+
+| 方法 & 路径 | 角色 | 说明 |
+| --- | --- | --- |
+| `POST /api/plans/:id/measurement-batches/preview` | 保管员 | 预演：逐行按年剂量 + 整批预计占用，不写库、不改额度 |
+| `POST /api/plans/:id/measurement-batches` | 保管员 | 导入为待确认批次（201；任一行错误 400 整批不保存） |
+| `GET  /api/plans/:id/measurement-batches` | 登录 | 该计划的批次列表 |
+| `GET  /api/measurement-batches/:id` | 登录 | 批次详情（含逐行按年剂量与确认后回联的 `measurementId`） |
+| `POST /api/measurement-batches/:id/confirm` | 保管员 | 确认批次：锁内重核，原子生成已确认实测；重复确认返回原结果 |
+| `DELETE /api/measurement-batches/:id` | 保管员 | 删除待确认批次（已确认批次不可删，400） |
+
+curl 调用示例（保管员 Cookie 存于 cookies-custodian.txt，计划 #7 已批准）：
+
+```bash
+# 1) 预演：逐行按自然年剂量 + 整批预计占用（不写库）
+curl -b cookies-custodian.txt -X POST \
+  http://localhost:3000/api/plans/7/measurement-batches/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"csv":"start,end,lux\n2026-06-01 09:00,2026-06-01 10:00,120\n2026-06-01 14:00,2026-06-01 16:00,110"}'
+
+# 2) 导入为待确认批次（201；待确认不计量）
+curl -b cookies-custodian.txt -X POST \
+  http://localhost:3000/api/plans/7/measurement-batches \
+  -H 'Content-Type: application/json' \
+  -d '{"csv":"2026-06-01 09:00,2026-06-01 10:00,120\n2026-06-01 14:00,2026-06-01 16:00,110",
+       "sourceName":"june.csv"}'
+
+# 3) 确认批次：原子生成已确认实测（重复调用返回原批次结果）
+curl -b cookies-custodian.txt -X POST http://localhost:3000/api/measurement-batches/1/confirm
+
+# 4) 查看批次详情 / 删除待确认批次
+curl -b cookies-custodian.txt http://localhost:3000/api/measurement-batches/1
+curl -b cookies-custodian.txt -X DELETE http://localhost:3000/api/measurement-batches/1
+```
+
+预演/导入成功响应中的 `preview`（“整批预计占用”按确认后口径：批次各行作为已确认实测
+替代对应估算残余后并入当前占用）：
+
+```json
+{
+  "preview": {
+    "planId": 7, "exhibitId": 3, "rowCount": 2,
+    "rows": [
+      { "row": 1, "start": "2026-06-01 09:00", "end": "2026-06-01 10:00",
+        "actualLux": 120, "yearly": { "2026": 120 } },
+      { "row": 2, "start": "2026-06-01 14:00", "end": "2026-06-01 16:00",
+        "actualLux": 110, "yearly": { "2026": 220 } }
+    ],
+    "batchYearly": { "2026": 340 },
+    "occupancy": {
+      "2026": { "year": 2026, "limit": 10000, "usedBefore": 2100, "batchDose": 340,
+                "projected": 2140, "remainingAfter": 7860, "excess": null, "missingLimit": false }
+    },
+    "overflows": []
+  }
+}
+```
+
+行错误（400，**整批不保存**）一次性列出全部行号与原因：
+
+```json
+{
+  "error": "CSV 校验未通过：第 1 行：时段 2026-06-01 08:00 ~ 2026-06-01 10:00 没有完整落在计划 #7 的开灯窗内；第 3 行：实际照度必须为正数，整批未保存",
+  "details": {
+    "rowErrors": [
+      { "row": 1, "reason": "时段 2026-06-01 08:00 ~ 2026-06-01 10:00 没有完整落在计划 #7 的开灯窗内" },
+      { "row": 3, "reason": "实际照度必须为正数" }
+    ]
+  }
+}
+```
+
+确认成功（200）响应：`batch`（`status: 'confirmed'`，逐行附 `measurementId`）+ `result`
+（确认结果快照：逐条实测编号/按年剂量、`batchYearly`、`overflows`、`flaggedPlans`）+ `detail`
+（最新展品详情）。**重复确认**返回 200 与 `alreadyConfirmed: true` 及原 `result`，不重复入账。
+确认前复核失败（如导入后新增了相交的停灯/实测）返回 **409**（`details.rowErrors`），
+**批次保持待确认且不计量**；确认导致超限**仍入账**，返回 409 并附 `overflows`/`flaggedPlans`
+（相关年度尚未开始且有估算残余的已批准计划已转待复核）。
+
+批次确认的实测就是普通已确认实测：实测列表/展品详情中仅附加 `batchId`/`batchRowNo` 溯源字段，
+年度占用与封存账册对照口径不变（账册来源仍为 `measurement:ID`）。审计写入
+`measurement_batch.import` / `measurement_batch.confirm` / `measurement_batch.delete`，
+由批次确认触发的计划转待复核写 `plan.flag_review`（原因注明实测批次）。
+
 ### 年度用光账册封存 `/api/exhibits/:id/ledgers`（保管员封存，登录可读）
 
 保管员可按**展品 + 已结束自然年**封存一份**不可变**用光账册。封存沿用现有固定时区与统一剂量口径，
@@ -1047,7 +1168,8 @@ src/
   dosing.js        剂量核心算法：时间窗、按年拆分、区间扣除、重叠/包含判断
   ledger.js        年度用光账册封存：按年快照构建（复用统一占用口径）、封存校验落账、封存值与当前重算的逐项/合计差额对照
   service.js       额度占用计算、批准校验、实测窗口校验、实测纠错（旧记录作废+替代记录确认+关联）、待复核筛选、调整申请试算/核对（含成对核准）、联合核准整组试算/核对、下调上限预演核算、停灯登记校验与按年扣减、计划外照明事故登记校验/窗内替代窗外单独计量口径
-  routes/          auth/users/exhibits/plans（含联合核准 batch 接口）/adjustments/measurements（含实测纠错 correct 接口）/blackouts/incidents（计划外照明事故）/ledgers（年度账册封存与对照）/audit 路由
+  measurement-batch.js 分段实测 CSV 解析（行号/表头/BOM）、批次逐行校验（窗口/相交）、整批预计占用预演、批次序列化
+  routes/          auth/users/exhibits/plans（含联合核准 batch 接口）/adjustments/measurements（含实测纠错 correct 接口）/measurement-batches（分段实测 CSV 批次：预演/导入/确认/删除）/blackouts/incidents（计划外照明事故）/ledgers（年度账册封存与对照）/audit 路由
 public/            原生 HTML/CSS/JS 单页界面
 scripts/test-utils.js  核心算法离线测试
 scripts/test-integration.js  基于 pg-mem 的端到端业务流程测试（含年度账册封存/对照/并发）

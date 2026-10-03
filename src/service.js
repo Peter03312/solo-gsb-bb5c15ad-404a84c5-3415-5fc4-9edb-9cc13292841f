@@ -374,7 +374,7 @@ function clipIntervalToWindowsForPlan(planWinList, incidentWindows) {
  * 扣除，再按其照度估算；事故窗内部分以事故实际照度计量（替代估算），窗外部分单独计量，
  * 事故不释放计划排期。
  */
-async function computeOccupancy(client, exhibitId, { excludePlanId = null, extraMeasurement = null } = {}) {
+async function computeOccupancy(client, exhibitId, { excludePlanId = null, extraMeasurement = null, extraMeasurements = null } = {}) {
   const plans = await getOccupyingPlans(client, exhibitId, excludePlanId);
   const measurements = await getActiveMeasurements(client, exhibitId);
   const limitRows = await client.query(
@@ -391,14 +391,17 @@ async function computeOccupancy(client, exhibitId, { excludePlanId = null, extra
     end: new Date(m.end_ts).getTime(),
     lux: Number(m.actual_lux),
   }));
-  // 预演一条尚未确认（或刚录入）的实测，用于超额预判
-  if (extraMeasurement) {
+  // 预演一条（或一批，如 CSV 批次确认前预演）尚未确认的实测，用于超额预判
+  const extras = [];
+  if (extraMeasurement) extras.push(extraMeasurement);
+  if (Array.isArray(extraMeasurements)) extras.push(...extraMeasurements);
+  for (const em of extras) {
     measWindows.push({
-      id: extraMeasurement.id || -1,
-      planId: extraMeasurement.planId,
-      start: extraMeasurement.start,
-      end: extraMeasurement.end,
-      lux: extraMeasurement.lux,
+      id: em.id || -1,
+      planId: em.planId,
+      start: em.start,
+      end: em.end,
+      lux: em.lux,
       draft: true,
     });
   }

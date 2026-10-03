@@ -8,6 +8,7 @@ const {
   positiveNumber,
   nonEmptyString,
 } = require('./validation');
+const { recordAudit } = require('./audit');
 const {
   buildWindows,
   doseByYear,
@@ -374,7 +375,7 @@ function clipIntervalToWindowsForPlan(planWinList, incidentWindows) {
  * 扣除，再按其照度估算；事故窗内部分以事故实际照度计量（替代估算），窗外部分单独计量，
  * 事故不释放计划排期。
  */
-async function computeOccupancy(client, exhibitId, { excludePlanId = null, extraMeasurement = null } = {}) {
+async function computeOccupancy(client, exhibitId, { excludePlanId = null, extraMeasurement = null, extraMeasurements = null } = {}) {
   const plans = await getOccupyingPlans(client, exhibitId, excludePlanId);
   const measurements = await getActiveMeasurements(client, exhibitId);
   const limitRows = await client.query(
@@ -391,14 +392,18 @@ async function computeOccupancy(client, exhibitId, { excludePlanId = null, extra
     end: new Date(m.end_ts).getTime(),
     lux: Number(m.actual_lux),
   }));
-  // 预演一条尚未确认（或刚录入）的实测，用于超额预判
-  if (extraMeasurement) {
+  // 预演一条或多条尚未确认（或刚录入）的实测，用于超额预判
+  // （实测批次预览/导入时传入整批行，口径与确认后一致：实测替代估算）
+  const extras = [];
+  if (extraMeasurement) extras.push(extraMeasurement);
+  if (Array.isArray(extraMeasurements)) extras.push(...extraMeasurements);
+  for (const em of extras) {
     measWindows.push({
-      id: extraMeasurement.id || -1,
-      planId: extraMeasurement.planId,
-      start: extraMeasurement.start,
-      end: extraMeasurement.end,
-      lux: extraMeasurement.lux,
+      id: em.id || -1,
+      planId: em.planId,
+      start: em.start,
+      end: em.end,
+      lux: em.lux,
       draft: true,
     });
   }
@@ -945,6 +950,238 @@ function plansToFlag(plans, occupancy, overflowYears, nowMs) {
     if (firstStart > nowMs) flagged.push({ plan, firstStart });
   }
   return flagged;
+}
+
+// ---------------------------------------------------------------------------
+// 实测确认/批次确认共用的超额处理
+// ---------------------------------------------------------------------------
+
+/**
+ * 按「确认实测生效后的占用」找出超额自然年（沿用确认实测口径）。
+ * occupancy 必须是按新实测预演（或实测已入账后重算）得到的占用结果；
+ * candidateYears 限定为本次剂量实际影响到的年份（新/旧实测按年剂量年份的并集），
+ * 避免把与本次操作无关、本已超限的年份也列入响应。
+ */
+function overflowInfoFromOccupancy(occupancy, candidateYears) {
+  const overflows = [];
+  const overflowYears = [];
+  for (const year of candidateYears) {
+    const info = occupancy.years[String(year)];
+    if (!info || info.limit === null) continue;
+    if (info.over) {
+      overflowYears.push(Number(year));
+      overflows.push({
+        year: Number(year),
+        limit: info.limit,
+        projected: info.used,
+        excess: Math.round((info.used - info.limit) * 1000) / 1000,
+      });
+    }
+  }
+  return { overflows, overflowYears };
+}
+
+/**
+ * 把超额年份对应的「同展品、已批准、该年仍有估算残余且尚未开始」的计划转待复核，
+ * 逐条写审计；返回被转计划的概要（与确认实测响应同构）。
+ */
+async function flagPlansForOverflow(client, actor, { exhibitId, occupancy, overflowYears, trigger, reason }) {
+  const activePlans = await getOccupyingPlans(client, exhibitId);
+  const flaggedTargets = plansToFlag(activePlans, occupancy, overflowYears, Date.now());
+  const flagged = flaggedTargets.map(({ plan: fp, firstStart }) => ({
+    id: fp.id,
+    title: fp.title,
+    firstStart: tsToWallString(firstStart),
+    overflowYears,
+  }));
+  for (const { plan: fp } of flaggedTargets) {
+    await client.query(
+      `UPDATE plans
+          SET status = 'pending_review',
+              review_reason = $2,
+              updated_at = now()
+        WHERE id = $1`,
+      [fp.id, reason(fp.id)]
+    );
+    await recordAudit(client, actor, 'plan.flag_review', 'plan', fp.id, {
+      ...trigger,
+      overflowYears,
+    });
+  }
+  return flagged;
+}
+
+// ---------------------------------------------------------------------------
+// 实测 CSV 导入批次（规则 18）
+// ---------------------------------------------------------------------------
+
+/**
+ * 实测批次逐行评估（导入预览 / 导入保存 / 确认重核共用同一口径）：
+ * 对解析后的行（{row,line,startMs,endMs,lux,note,errors}）在展品当前数据下核对：
+ *   - 时段完整落在该计划当前开灯窗内（kind: 'window'）
+ *   - 不与同展品未作废实测（含待确认草稿）相交（kind: 'overlap'）
+ *   - 不与同展品停灯记录相交（kind: 'overlap'）
+ *   - 不与同展品计划外照明事故相交（kind: 'overlap'）
+ *   - 批次内部行与行不得相交（kind: 'overlap'，记在后一行上）
+ * 解析/取值类错误（kind: 'value'）由 csv.js 先行写入；本函数先把字符串错误规范化。
+ * 每行追加 errors: [{kind,message}] 与 conflicts；全部有效的行计算 yearly 并汇总 totalYearly。
+ * 返回 { rows, errorRows, totalYearly }；调用方负责计划状态校验与错误状态码归并。
+ */
+async function evaluateMeasurementBatch(client, plan, rows) {
+  const windows = planWindows(plan);
+  const exhibitId = plan.exhibit_id;
+
+  // 一次性取出同展品冲突源（避免逐行查询；在展品锁事务内调用时视图一致）
+  const { rows: measRows } = await client.query(
+    `SELECT id, plan_id, status, start_ts, end_ts FROM measurements
+      WHERE exhibit_id = $1 AND status <> 'annulled'
+      ORDER BY id`,
+    [exhibitId]
+  );
+  const { rows: blackoutRows } = await client.query(
+    `SELECT id, plan_id, start_ts, end_ts FROM blackouts
+      WHERE exhibit_id = $1
+      ORDER BY id`,
+    [exhibitId]
+  );
+  const { rows: incidentRows } = await client.query(
+    `SELECT id, start_ts, end_ts FROM lighting_incidents
+      WHERE exhibit_id = $1
+      ORDER BY id`,
+    [exhibitId]
+  );
+  // 冲突消息中的计划标题（拆简单查询，规避个别内存驱动的 JOIN 缺陷）
+  const planIds = [...new Set([
+    ...measRows.map((m) => Number(m.plan_id)),
+    ...blackoutRows.map((b) => Number(b.plan_id)),
+  ])];
+  const titleMap = new Map();
+  if (planIds.length > 0) {
+    const placeholders = planIds.map((_, i) => `$${i + 1}`).join(',');
+    const tRows = await client.query(
+      `SELECT id, title FROM plans WHERE id IN (${placeholders})`,
+      planIds
+    );
+    for (const t of tRows.rows) titleMap.set(Number(t.id), t.title);
+  }
+
+  const meas = measRows.map((m) => ({
+    id: m.id,
+    planId: Number(m.plan_id),
+    status: m.status,
+    start: new Date(m.start_ts).getTime(),
+    end: new Date(m.end_ts).getTime(),
+  }));
+  const blacks = blackoutRows.map((b) => ({
+    id: b.id,
+    planId: Number(b.plan_id),
+    start: new Date(b.start_ts).getTime(),
+    end: new Date(b.end_ts).getTime(),
+  }));
+  const incs = incidentRows.map((x) => ({
+    id: x.id,
+    start: new Date(x.start_ts).getTime(),
+    end: new Date(x.end_ts).getTime(),
+  }));
+
+  for (const r of rows) {
+    // 解析期错误（字符串）规范化为 {kind:'value'}
+    r.errors = (r.errors || []).map((e) => (typeof e === 'string' ? { kind: 'value', message: e } : e));
+    if (r.startMs === null || r.endMs === null) continue;
+    r.start = tsToWallString(r.startMs);
+    r.end = tsToWallString(r.endMs);
+    const seg = { start: r.startMs, end: r.endMs };
+    const conflicts = {
+      overlappingRows: [],
+      overlappingMeasurements: [],
+      overlappingBlackouts: [],
+      overlappingIncidents: [],
+    };
+
+    if (!windows.some((w) => containsInterval(w, seg))) {
+      r.errors.push({
+        kind: 'window',
+        message: `时段 ${r.start} ~ ${r.end} 没有完整落在计划 #${plan.id} 的开灯窗内`,
+      });
+    }
+    for (const m of meas) {
+      if (m.start < seg.end && seg.start < m.end) {
+        conflicts.overlappingMeasurements.push({
+          id: m.id,
+          planId: m.planId,
+          status: m.status,
+          start: tsToWallString(m.start),
+          end: tsToWallString(m.end),
+        });
+      }
+    }
+    for (const b of blacks) {
+      if (b.start < seg.end && seg.start < b.end) {
+        conflicts.overlappingBlackouts.push({
+          id: b.id,
+          planId: b.planId,
+          planTitle: titleMap.get(b.planId) || null,
+          start: tsToWallString(b.start),
+          end: tsToWallString(b.end),
+        });
+      }
+    }
+    for (const x of incs) {
+      if (x.start < seg.end && seg.start < x.end) {
+        conflicts.overlappingIncidents.push({
+          id: x.id,
+          start: tsToWallString(x.start),
+          end: tsToWallString(x.end),
+        });
+      }
+    }
+    for (const c of conflicts.overlappingMeasurements) {
+      r.errors.push({
+        kind: 'overlap',
+        message: `与${c.status === 'draft' ? '待确认' : '已确认'}实测 #${c.id}（${c.start} ~ ${c.end}）相交`,
+      });
+    }
+    for (const c of conflicts.overlappingBlackouts) {
+      r.errors.push({
+        kind: 'overlap',
+        message: `与停灯记录 #${c.id}（计划「${c.planTitle || `#${c.planId}`}」，${c.start} ~ ${c.end}）相交`,
+      });
+    }
+    for (const c of conflicts.overlappingIncidents) {
+      r.errors.push({
+        kind: 'overlap',
+        message: `与计划外照明事故 #${c.id}（${c.start} ~ ${c.end}）相交`,
+      });
+    }
+    r.conflicts = conflicts;
+  }
+
+  // 行间相交：仅在“个体校验全部通过”的行之间检查（已有取值/窗口/相交错误的行不参与，
+  // 避免把针对失效行的相交噪音报给有效行）；按开始时刻排序，后行撞前行记在后一行
+  // （端点相接不算相交）。
+  const timed = rows
+    .filter((r) => r.startMs !== null && r.endMs !== null && r.errors.length === 0)
+    .sort((a, b) => a.startMs - b.startMs || a.row - b.row);
+  for (let i = 0; i < timed.length; i++) {
+    for (let j = i + 1; j < timed.length; j++) {
+      if (timed[j].startMs >= timed[i].endMs) break;
+      timed[j].errors.push({
+        kind: 'overlap',
+        message: `与第 ${timed[i].row} 行（${timed[i].start} ~ ${timed[i].end}）时段相交`,
+      });
+      timed[j].conflicts.overlappingRows.push(timed[i].row);
+    }
+  }
+
+  // 有效行按自然年拆分剂量并汇总整批剂量
+  const totalYearly = {};
+  for (const r of rows) {
+    if (r.startMs === null || r.errors.length > 0) continue;
+    r.yearly = yearMapToObject(doseByYear([{ start: r.startMs, end: r.endMs }], r.lux));
+    addYearDose(totalYearly, r.yearly);
+  }
+  const errorRows = rows.filter((r) => r.errors.length > 0);
+  return { rows, errorRows, totalYearly };
 }
 
 // ---------------------------------------------------------------------------
@@ -2037,6 +2274,9 @@ module.exports = {
   validateMeasurementWindow,
   correctMeasurement,
   plansToFlag,
+  overflowInfoFromOccupancy,
+  flagPlansForOverflow,
+  evaluateMeasurementBatch,
   computeLimitPreview,
   yearOfTs,
   // 调整申请

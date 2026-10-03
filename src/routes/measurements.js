@@ -14,11 +14,11 @@ const {
 const {
   lockExhibit,
   getPlan,
-  getOccupyingPlans,
   validateMeasurementWindow,
   correctMeasurement,
   computeOccupancy,
-  plansToFlag,
+  overflowInfoFromOccupancy,
+  flagPlansForOverflow,
 } = require('../service');
 const { doseByYear, yearMapToObject, tsToWallString } = require('../dosing');
 const { exhibitDetail, serializeMeasurement } = require('./exhibits');
@@ -35,61 +35,6 @@ function parseMeasurementBody(body) {
   const endMinute = parseTimeToMinutes(body.endTime);
   if (endDate < startDate) throw new ValidationError('实测结束日期不能早于开始日期');
   return { startDate, endDate, startMinute, endMinute };
-}
-
-/**
- * 按「确认实测生效后的占用」找出超额自然年（沿用确认实测口径）。
- * occupancy 必须是按 extraMeasurement 预演得到的占用结果；
- * candidateYears 限定为本次剂量实际影响到的年份（新/旧实测按年剂量年份的并集），
- * 避免把与本次操作无关、本已超限的年份也列入响应。
- */
-function overflowInfoFromOccupancy(occupancy, candidateYears) {
-  const overflows = [];
-  const overflowYears = [];
-  for (const year of candidateYears) {
-    const info = occupancy.years[String(year)];
-    if (!info || info.limit === null) continue;
-    if (info.over) {
-      overflowYears.push(Number(year));
-      overflows.push({
-        year: Number(year),
-        limit: info.limit,
-        projected: info.used,
-        excess: Math.round((info.used - info.limit) * 1000) / 1000,
-      });
-    }
-  }
-  return { overflows, overflowYears };
-}
-
-/**
- * 把超额年份对应的「同展品、已批准、该年仍有估算残余且尚未开始」的计划转待复核，
- * 逐条写审计；返回被转计划的概要（与确认实测响应同构）。
- */
-async function flagPlansForOverflow(client, actor, { exhibitId, occupancy, overflowYears, trigger, reason }) {
-  const activePlans = await getOccupyingPlans(client, exhibitId);
-  const flaggedTargets = plansToFlag(activePlans, occupancy, overflowYears, Date.now());
-  const flagged = flaggedTargets.map(({ plan: fp, firstStart }) => ({
-    id: fp.id,
-    title: fp.title,
-    firstStart: tsToWallString(firstStart),
-    overflowYears,
-  }));
-  for (const { plan: fp } of flaggedTargets) {
-    await client.query(
-      `UPDATE plans
-          SET status = 'pending_review',
-              review_reason = $2,
-              updated_at = now()
-        WHERE id = $1`,
-      [fp.id, reason(fp.id)]
-    );
-    await recordAudit(client, actor, 'plan.flag_review', 'plan', fp.id, {
-      ...trigger,
-      overflowYears,
-    });
-  }
-  return flagged;
 }
 
 // 实测列表（可按展品过滤）

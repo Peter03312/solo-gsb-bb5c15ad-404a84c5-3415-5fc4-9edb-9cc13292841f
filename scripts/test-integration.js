@@ -93,6 +93,41 @@ function call(method, urlPath, body, role) {
   });
 }
 
+/** 以指定 Content-Type 提交原始文本（如 text/csv 的 CSV 原文）。 */
+function callRaw(method, urlPath, rawBody, contentType, role) {
+  const cookie = role ? cookies.get(role) : null;
+  return new Promise((resolve, reject) => {
+    const data = rawBody != null ? String(rawBody) : null;
+    const req = http.request(
+      `${base}${urlPath}`,
+      {
+        method,
+        headers: {
+          'Content-Type': contentType,
+          ...(data ? { 'Content-Length': Buffer.byteLength(data) } : {}),
+          ...(cookie ? { Cookie: `lqsession=${cookie}` } : {}),
+        },
+      },
+      (res) => {
+        let chunks = '';
+        res.on('data', (c) => (chunks += c));
+        res.on('end', () => {
+          let json = null;
+          try {
+            json = JSON.parse(chunks);
+          } catch (_) {
+            /* ignore */
+          }
+          resolve({ status: res.statusCode, body: json });
+        });
+      }
+    );
+    req.on('error', reject);
+    if (data) req.write(data);
+    req.end();
+  });
+}
+
 async function main() {
   await initializeDatabase();
 
@@ -2473,6 +2508,281 @@ async function runFlow() {
   r = await call('GET', `/api/exhibits/${exIn7}`, null, 'i');
   assert(r.body.years[2024].used === 500 && r.body.years[2030].used === 800,
     '事故 500 始终计入 2024 实际用光，2030 计划残余不变');
+
+  // ================= 实测 CSV 批次导入（规则 18）=================
+  const exB = await createExhibit('批次导入展品');
+  await call('POST', `/api/exhibits/${exB}/limits`, { year: 2031, limitLxh: 10000 }, 'c');
+  // bp1：2031-03-01~03-02 每天 09-17，100lx → 1600
+  const bp1 = await submitPlan(exB, '批次目标计划', '2031-03-01', '2031-03-02', ['09:00-17:00'], 100);
+  await approvePlan(bp1);
+  const bpSubmitted = await submitPlan(exB, '批次未批准计划', '2031-04-01', '2031-04-01',
+    ['09:00-10:00'], 100);
+
+  const csvGood =
+    '开始时间,结束时间,实际照度,备注\n' +
+    '2031-03-01 09:00,2031-03-01 12:00,120,上午\n' +
+    '2031-03-01T13:00,2031-03-01T17:00,120,\n' +
+    '2031-03-02 09:00,2031-03-02 17:00,150,次日\n';
+
+  // ---- 权限与组成性校验 ----
+  r = await call('POST', '/api/measurement-batches/preview', { planId: bp1, csv: csvGood }, 'i');
+  assert(r.status === 403, '布展员不能预览批次');
+  r = await call('POST', '/api/measurement-batches', { planId: bp1, csv: csvGood }, 'i');
+  assert(r.status === 403, '布展员不能导入批次');
+  r = await call('POST', '/api/measurement-batches/preview',
+    { planId: bpSubmitted, csv: csvGood }, 'c');
+  assert(r.status === 400 && /已批准/.test(r.body.error), '待批准计划不能导入批次');
+  r = await call('POST', '/api/measurement-batches/preview', { planId: bp1, csv: '' }, 'c');
+  assert(r.status === 400, '空 CSV 拒绝');
+  r = await call('POST', '/api/measurement-batches/preview',
+    { planId: bp1, csv: '开始时间,结束时间,实际照度\n' }, 'c');
+  assert(r.status === 400 && /没有数据行/.test(r.body.error), '仅表头拒绝');
+
+  // ---- 预览：逐行按年剂量 + 整批预计占用，不改变额度 ----
+  r = await call('POST', '/api/measurement-batches/preview', { planId: bp1, csv: csvGood }, 'c');
+  assert(r.status === 200, `预览成功（实际 ${r.status} ${r.body && r.body.error}）`);
+  const bpv = r.body.preview;
+  assert(bpv.headerDetected === true && bpv.rowCount === 3, '表头自动识别 + 3 行');
+  assert(bpv.rows[0].yearly['2031'] === 360 && bpv.rows[1].yearly['2031'] === 480 &&
+    bpv.rows[2].yearly['2031'] === 1200, '逐行按年剂量 360/480/1200');
+  assert(bpv.totalYearly['2031'] === 2040, '整批剂量 2040');
+  const bpj = bpv.projectedYears['2031'];
+  assert(bpj.usedBefore === 1600 && bpj.batchDose === 2040 && bpj.replacedEstimate === 1500 &&
+    bpj.projected === 2140 && bpj.over === false,
+    `整批预计占用 1600-1500+2040=2140，实际=${JSON.stringify(bpj)}`);
+  r = await call('GET', `/api/exhibits/${exB}`, null, 'i');
+  assert(r.body.years['2031'].used === 1600, '预览不改变额度');
+  assert((r.body.measurementBatches || []).length === 0, '预览不保存批次');
+
+  // ---- 导入：保存待确认批次，不改变额度 ----
+  r = await call('POST', '/api/measurement-batches',
+    { planId: bp1, csv: csvGood, sourceName: 'march.csv' }, 'c');
+  assert(r.status === 201, `导入成功（实际 ${r.status} ${r.body && r.body.error}）`);
+  const batch1 = r.body.batch;
+  assert(batch1.status === 'pending' && batch1.rowCount === 3 &&
+    batch1.sourceName === 'march.csv', '批次待确认');
+  assert(batch1.totalYearly['2031'] === 2040 && batch1.rows.length === 3, '批次含逐行与整批剂量');
+  assert(r.body.projectedYears['2031'].projected === 2140, '导入响应附整批预计占用');
+  r = await call('GET', `/api/exhibits/${exB}`, null, 'i');
+  assert(r.body.years['2031'].used === 1600, '待确认批次不占额度');
+  assert(r.body.measurements.length === 0, '待确认批次不生成实测');
+  assert(r.body.measurementBatches.length === 1 &&
+    r.body.measurementBatches[0].status === 'pending', '展品详情附待确认批次摘要');
+
+  // ---- 列表与详情（布展员只读）----
+  r = await call('GET', `/api/measurement-batches?exhibitId=${exB}&status=pending`, null, 'i');
+  assert(r.status === 200 && r.body.batches.length === 1 &&
+    r.body.batches[0].id === batch1.id, '批次列表过滤');
+  r = await call('GET', `/api/measurement-batches/${batch1.id}`, null, 'i');
+  assert(r.status === 200 && r.body.batch.rows.length === 3 &&
+    r.body.batch.rows[0].note === '上午', '批次详情含逐行与备注');
+
+  // ---- 确认：原子生成已确认实测并记批次审计 ----
+  r = await call('POST', `/api/measurement-batches/${batch1.id}/confirm`, {}, 'c');
+  assert(r.status === 200, `批次确认成功（实际 ${r.status} ${r.body && r.body.error}）`);
+  assert(r.body.batch.status === 'confirmed' &&
+    r.body.confirmResult.measurementIds.length === 3, '批次确认生成 3 条实测');
+  const batch1MeasIds = r.body.confirmResult.measurementIds;
+  r = await call('GET', `/api/exhibits/${exB}`, null, 'i');
+  assert(r.body.years['2031'].used === 2140,
+    `确认后占用 2140（实测替代估算），实际 ${r.body.years['2031'].used}`);
+  assert(r.body.measurements.length === 3 &&
+    r.body.measurements.every((m) => m.importBatchId === batch1.id && m.status === 'confirmed'),
+    '批次实测带 importBatchId 且已确认');
+  assert(r.body.measurements.some((m) => m.note === '上午'), 'CSV 备注列写入实测 note');
+
+  // ---- 重复确认：返回原批次结果，不重复生成 ----
+  r = await call('POST', `/api/measurement-batches/${batch1.id}/confirm`, {}, 'c');
+  assert(r.status === 200 && r.body.duplicate === true, '重复确认幂等返回');
+  assert(JSON.stringify(r.body.confirmResult.measurementIds) === JSON.stringify(batch1MeasIds),
+    '重复确认返回原批次结果（相同实测编号）');
+  r = await call('GET', `/api/exhibits/${exB}`, null, 'i');
+  assert(r.body.measurements.length === 3, '重复确认不重复生成实测');
+
+  // ---- 批次审计 ----
+  r = await call('GET', `/api/audit?targetType=measurement_batch&targetId=${batch1.id}`, null, 'c');
+  const batchActions = r.body.events.map((e) => e.action);
+  assert(batchActions.includes('measurement_batch.import') &&
+    batchActions.includes('measurement_batch.confirm'), '批次导入与确认均写审计');
+
+  // ---- 行级校验：列出行号与原因，整批不保存 ----
+  const exE = await createExhibit('批次校验展品');
+  await call('POST', `/api/exhibits/${exE}/limits`, { year: 2031, limitLxh: 10000 }, 'c');
+  const ep1 = await submitPlan(exE, '校验目标计划', '2031-03-01', '2031-03-01', ['09:00-17:00'], 100);
+  await approvePlan(ep1);
+  const csvBad =
+    '2031-03-01 08:00,2031-03-01 10:00,100\n' +   // 行1 越出开灯窗
+    '2031-03-01 10:00,2031-03-01 09:00,100\n' +   // 行2 负时长
+    '2031-03-01 10:00,2031-03-01 11:00,abc\n' +   // 行3 照度非数字
+    '2031-03-01 10:00,2031-03-01 11:00,-5\n' +    // 行4 照度非正
+    '2031-03-01 10:00,2031-03-01 11:00,100\n' +   // 行5 有效
+    '2031-03-01 10:30,2031-03-01 12:00,100\n' +   // 行6 与行5相交
+    'bad,2031-03-01 12:00,100\n' +                // 行7 日期无效
+    '2031-03-01 12:00,2031-03-01 13:00\n';        // 行8 列数不足
+  r = await call('POST', '/api/measurement-batches', { planId: ep1, csv: csvBad }, 'c');
+  assert(r.status === 400, '取值/窗口类错误返回 400');
+  const badRows = r.body.details.rows.map((x) => x.row);
+  assert(JSON.stringify(badRows) === JSON.stringify([1, 2, 3, 4, 6, 7, 8]),
+    `列出行号 1,2,3,4,6,7,8，实际=${JSON.stringify(badRows)}`);
+  assert(r.body.details.rows.find((x) => x.row === 6).reasons.some((m) => /第 5 行/.test(m)),
+    '行6 报与第 5 行相交');
+  assert(r.body.details.rows.find((x) => x.row === 1).reasons.some((m) => /开灯窗/.test(m)),
+    '行1 报越出开灯窗');
+  r = await call('GET', `/api/measurement-batches?exhibitId=${exE}&status=pending`, null, 'c');
+  assert(r.body.batches.length === 0, '有错误整批不保存');
+
+  // ---- 相交冲突（与既有实测/停灯/事故）→ 409，整批不保存 ----
+  r = await call('POST', '/api/measurements', {
+    planId: ep1, startDate: '2031-03-01', startTime: '10:00',
+    endDate: '2031-03-01', endTime: '11:00', actualLux: 100,
+  }, 'c');
+  const epMeas = r.body.measurement.id;
+  r = await call('POST', `/api/measurements/${epMeas}/confirm`, {}, 'c');
+  assert(r.status === 200, '预置已确认实测');
+  r = await call('POST', '/api/measurement-batches', {
+    planId: ep1, csv: '2031-03-01 10:30,2031-03-01 12:00,100\n',
+  }, 'c');
+  assert(r.status === 409 && r.body.details.rows[0].conflicts.overlappingMeasurements.length === 1,
+    '与已确认实测相交 → 409');
+
+  const ymdYesterday = dosing.tsToWall(Date.now() - 86400000).ymd;
+  const wallYY = Number(ymdYesterday.slice(0, 4));
+  const exBp = await createExhibit('批次停灯事故展品');
+  await call('POST', `/api/exhibits/${exBp}/limits`, { year: wallYY, limitLxh: 100000 }, 'c');
+  const pp1 = await submitPlan(exBp, '昨日计划', ymdYesterday, ymdYesterday, ['09:00-17:00'], 100);
+  await approvePlan(pp1);
+  r = await call('POST', '/api/blackouts', {
+    planId: pp1, startDate: ymdYesterday, startTime: '10:00',
+    endDate: ymdYesterday, endTime: '11:00', reason: '检修',
+  }, 'c');
+  assert(r.status === 201, '预置停灯');
+  r = await call('POST', '/api/measurement-batches', {
+    planId: pp1, csv: `${ymdYesterday} 10:30,${ymdYesterday} 12:00,100\n`,
+  }, 'c');
+  assert(r.status === 409 && r.body.details.rows[0].conflicts.overlappingBlackouts.length === 1,
+    '与停灯相交 → 409');
+  r = await call('POST', '/api/incidents', {
+    exhibitId: exBp, startDate: ymdYesterday, startTime: '15:00',
+    endDate: ymdYesterday, endTime: '16:00', actualLux: 200, reason: '误开灯',
+  }, 'c');
+  assert(r.status === 201, '预置事故');
+  r = await call('POST', '/api/measurement-batches', {
+    planId: pp1, csv: `${ymdYesterday} 15:30,${ymdYesterday} 16:30,100\n`,
+  }, 'c');
+  assert(r.status === 409 && r.body.details.rows[0].conflicts.overlappingIncidents.length === 1,
+    '与事故相交 → 409');
+  r = await call('GET', `/api/measurement-batches?exhibitId=${exBp}`, null, 'c');
+  assert(r.body.batches.length === 0, '相交冲突整批不保存');
+
+  // ---- 确认时重核：导入后新增重叠实测 → 确认失败保持待确认且不计量 ----
+  r = await call('POST', '/api/measurement-batches', {
+    planId: ep1, csv: '2031-03-01 12:00,2031-03-01 13:00,100\n',
+  }, 'c');
+  assert(r.status === 201, '导入批次 B2');
+  const batchB2 = r.body.batch.id;
+  r = await call('POST', '/api/measurements', {
+    planId: ep1, startDate: '2031-03-01', startTime: '12:30',
+    endDate: '2031-03-01', endTime: '13:30', actualLux: 100,
+  }, 'c');
+  assert(r.status === 201, '导入后录入重叠草稿实测');
+  const clashDraft = r.body.measurement.id;
+  r = await call('POST', `/api/measurement-batches/${batchB2}/confirm`, {}, 'c');
+  assert(r.status === 409 && /保持待确认/.test(r.body.error), '确认时重核发现重叠 → 409 保持待确认');
+  assert(r.body.details.rows[0].conflicts.overlappingMeasurements.length === 1, '指出冲突实测');
+  r = await call('GET', `/api/measurement-batches/${batchB2}`, null, 'c');
+  assert(r.body.batch.status === 'pending', '批次保持待确认');
+  r = await call('GET', `/api/exhibits/${exE}`, null, 'c');
+  assert(r.body.measurements.filter((m) => m.importBatchId === batchB2).length === 0,
+    '确认失败不生成实测（不计量）');
+  r = await call('DELETE', `/api/measurements/${clashDraft}`, null, 'c');
+  assert(r.status === 200, '删除冲突草稿');
+  r = await call('POST', `/api/measurement-batches/${batchB2}/confirm`, {}, 'c');
+  assert(r.status === 200 && r.body.batch.status === 'confirmed', '解除冲突后确认成功');
+
+  // ---- 计划已取消 → 确认失败保持待确认 ----
+  r = await call('POST', '/api/measurement-batches', {
+    planId: ep1, csv: '2031-03-01 14:00,2031-03-01 15:00,100\n',
+  }, 'c');
+  const batchB3 = r.body.batch.id;
+  r = await call('POST', `/api/plans/${ep1}/cancel`, { reason: '测试取消' }, 'c');
+  assert(r.status === 200, '取消计划');
+  r = await call('POST', `/api/measurement-batches/${batchB3}/confirm`, {}, 'c');
+  assert(r.status === 409 && /保持待确认/.test(r.body.error), '计划已取消 → 确认失败保持待确认');
+
+  // ---- 确认导致超限仍入账：列出超额年份并转待复核 ----
+  const exO = await createExhibit('批次超限展品');
+  await call('POST', `/api/exhibits/${exO}/limits`, { year: 2031, limitLxh: 1000 }, 'c');
+  const ovP = await submitPlan(exO, '超限目标计划', '2031-05-01', '2031-05-01', ['09:00-17:00'], 100); // 800
+  await approvePlan(ovP);
+  const ovFuture = await submitPlan(exO, '未开始计划', '2031-07-01', '2031-07-01', ['09:00-12:00'], 50); // 150
+  await approvePlan(ovFuture); // 合计 950 ≤ 1000
+  r = await call('POST', '/api/measurement-batches', {
+    planId: ovP, csv: '2031-05-01 09:00,2031-05-01 17:00,200\n', // 1600
+  }, 'c');
+  assert(r.status === 201, '超限批次可导入（导入不校验额度）');
+  const batchOv = r.body.batch.id;
+  r = await call('POST', `/api/measurement-batches/${batchOv}/confirm`, {}, 'c');
+  assert(r.status === 409, '确认导致超限返回 409（仍入账）');
+  const ovf = r.body.overflows.find((o) => o.year === 2031);
+  assert(ovf && ovf.projected === 1750 && ovf.excess === 750,
+    `2031 超额 750（1600+150=1750），实际=${JSON.stringify(r.body.overflows)}`);
+  assert(r.body.flaggedPlans.some((p) => p.id === ovFuture), '未开始且有残余的计划转待复核');
+  assert(!r.body.flaggedPlans.some((p) => p.id === ovP), '残余为 0 的本计划不转待复核');
+  assert(r.body.batch.status === 'confirmed', '超限批次仍确认入账');
+  r = await call('GET', `/api/exhibits/${exO}`, null, 'c');
+  assert(r.body.years['2031'].used === 1750, '超限后占用如实显示 1750');
+  assert(r.body.plans.find((p) => p.id === ovFuture).status === 'pending_review',
+    '未开始计划已转待复核');
+  r = await call('POST', `/api/measurement-batches/${batchOv}/confirm`, {}, 'c');
+  assert(r.status === 200 && r.body.duplicate === true &&
+    r.body.confirmResult.overflows.length === 1, '重复确认返回原批次结果（含超额年份）');
+  r = await call('GET', `/api/exhibits/${exO}`, null, 'c');
+  assert(r.body.measurements.length === 1, '重复确认不重复入账');
+
+  // ---- CSV 格式细节：秒级 / text/csv 原文 ----
+  const exBr = await createExhibit('批次格式展品');
+  await call('POST', `/api/exhibits/${exBr}/limits`, { year: 2031, limitLxh: 10000 }, 'c');
+  const rp1 = await submitPlan(exBr, '格式目标计划', '2031-03-01', '2031-03-01', ['09:00-17:00'], 100);
+  await approvePlan(rp1);
+  r = await call('POST', '/api/measurement-batches/preview', {
+    planId: rp1, csv: '2031-03-01 09:00:30,2031-03-01 10:00,100\n',
+  }, 'c');
+  assert(r.status === 400 && /秒级/.test(r.body.error), '非零秒拒绝');
+  r = await call('POST', '/api/measurement-batches/preview', {
+    planId: rp1, csv: '2031-03-01 09:00:00,2031-03-01 10:00,100\n',
+  }, 'c');
+  assert(r.status === 200 && r.body.preview.rows[0].yearly['2031'] === 100, ':00 秒可接受');
+  r = await callRaw('POST', `/api/measurement-batches/preview?planId=${rp1}`,
+    '2031-03-01 10:00,2031-03-01 11:00,100\n', 'text/csv', 'c');
+  assert(r.status === 200 && r.body.preview.rowCount === 1, 'text/csv 原文预览（planId 走查询参数）');
+
+  // ---- 封存账册对照兼容：批次实测与单条实测同口径进入账册 ----
+  const wallY3 = Number(dosing.tsToWall(Date.now()).ymd.slice(0, 4));
+  const pastY = wallY3 - 2;
+  const exBl = await createExhibit('批次账册展品');
+  await call('POST', `/api/exhibits/${exBl}/limits`, { year: pastY, limitLxh: 5000 }, 'c');
+  const lp = await submitPlan(exBl, '账册批次计划', `${pastY}-05-01`, `${pastY}-05-01`,
+    ['09:00-17:00'], 100); // 800
+  await approvePlan(lp);
+  r = await call('POST', '/api/measurement-batches', {
+    planId: lp,
+    csv: `${pastY}-05-01 09:00,${pastY}-05-01 12:00,150\n${pastY}-05-01 13:00,${pastY}-05-01 17:00,100\n`,
+  }, 'c');
+  assert(r.status === 201, '账册展品批次导入');
+  const batchL = r.body.batch.id;
+  r = await call('POST', `/api/measurement-batches/${batchL}/confirm`, {}, 'c');
+  assert(r.status === 200, '账册展品批次确认（450+400=850 ≤ 5000）');
+  r = await call('POST', `/api/exhibits/${exBl}/ledgers`, { year: pastY }, 'c');
+  assert(r.status === 201, '封存成功');
+  const lgB = r.body.ledger;
+  assert(lgB.confirmedTotal === 850 && lgB.residueTotal === 100 && lgB.total === 950,
+    `账册：实测850 残余100 合计950，实际=${JSON.stringify({
+      c: lgB.confirmedTotal, r: lgB.residueTotal, t: lgB.total })}`);
+  const batchMeasItems = lgB.items.filter((it) => it.kind === 'measurement');
+  assert(batchMeasItems.length === 2 &&
+    batchMeasItems.every((it) => it.sourceKey.startsWith('measurement:')),
+    '批次实测作为 measurement 来源进入账册（sourceKey 口径一致）');
+  assert(lgB.comparison.totals.total.zeroDifference === true, '封存瞬间对照零差额');
 }
 
 main().catch((err) => {

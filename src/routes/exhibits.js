@@ -39,6 +39,8 @@ function serializeMeasurement(m) {
     confirmedBy: m.confirmed_by != null ? Number(m.confirmed_by) : null,
     confirmedAt: m.confirmed_at || null,
     planTitle: m.plan_title != null ? m.plan_title : (m.planTitle || null),
+    // 实测 CSV 导入批次溯源（单条录入为 null，仅附加字段）
+    importBatchId: m.import_batch_id != null ? Number(m.import_batch_id) : null,
   };
 }
 
@@ -92,6 +94,22 @@ async function exhibitDetail(client, exhibitId, { lock = false } = {}) {
     ledgers.push(serializeLedger(row, diffSnapshots(sealedSnap, currentSnap)));
   }
 
+  // 实测 CSV 导入批次（待确认/已确认；仅附加字段，既有字段不变）
+  // 延迟 require 以避免与 routes/measurement-batches 形成循环依赖
+  const { serializeMeasurementBatch } = require('./measurement-batches');
+  const { rows: measurementBatchRows } = await client.query(
+    `SELECT b.*, p.title AS plan_title, u.display_name AS creator_name
+       FROM measurement_import_batches b
+       JOIN plans p ON p.id = b.plan_id
+       LEFT JOIN users u ON u.id = b.created_by
+      WHERE b.exhibit_id = $1
+      ORDER BY b.id DESC`,
+    [exhibitId]
+  );
+  const measurementBatches = measurementBatchRows.map(
+    (b) => serializeMeasurementBatch(b, { withRows: false })
+  );
+
   return {
     exhibit,
     years: occupancy.years,
@@ -103,6 +121,7 @@ async function exhibitDetail(client, exhibitId, { lock = false } = {}) {
     incidents,
     incidentDoseYearly,
     ledgers,
+    measurementBatches,
   };
 }
 

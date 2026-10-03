@@ -160,6 +160,35 @@ CREATE TABLE IF NOT EXISTS lighting_incidents (
 );
 CREATE INDEX IF NOT EXISTS idx_incident_exhibit ON lighting_incidents (exhibit_id, id);
 
+-- 实测 CSV 导入批次（规则 18）：保管员把某条已批准计划的分段实测 CSV 导入为待确认批次。
+-- 每行含墙上起止日期时间与实际照度；导入时逐行校验（正时长、正照度、完整落在计划开灯窗内、
+-- 行间及与同展品未作废实测/停灯/照明事故不相交），任一错误整批不保存。
+-- 待确认批次不占额度、不参与任何重叠判定；确认时在展品锁事务内按实时占用重新校验，
+-- 全部有效才原子生成已确认实测（measurements.import_batch_id 关联）并记录批次审计；
+-- 校验失败批次保持待确认且不计量；重复确认幂等返回 confirm_result 中的原批次结果。
+CREATE TABLE IF NOT EXISTS measurement_import_batches (
+    id              BIGSERIAL PRIMARY KEY,
+    plan_id         BIGINT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+    exhibit_id      BIGINT NOT NULL REFERENCES exhibits(id) ON DELETE CASCADE,
+    status          TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','confirmed')),
+    source_name     TEXT,
+    row_count       INTEGER NOT NULL,
+    rows_json       JSONB NOT NULL,
+    total_yearly    JSONB NOT NULL,
+    measurement_ids JSONB,
+    confirm_result  JSONB,
+    created_by      BIGINT REFERENCES users(id),
+    confirmed_by    BIGINT REFERENCES users(id),
+    confirmed_at    TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_mib_exhibit ON measurement_import_batches (exhibit_id, id);
+CREATE INDEX IF NOT EXISTS idx_mib_plan ON measurement_import_batches (plan_id, id);
+
+-- 批次确认生成的实测记录关联回导入批次（既有单条实测该列为 NULL，既有字段与口径不变）。
+ALTER TABLE measurements ADD COLUMN IF NOT EXISTS import_batch_id BIGINT
+    REFERENCES measurement_import_batches(id);
+
 -- 年度用光账册封存（保管员可对展品“已结束的自然年”封存一份不可变账册）。
 -- 封存时按当时的固定时区与统一剂量口径原子记录：
 --   当年上限、已确认实测剂量合计、各计划“开灯窗 − 已确认实测覆盖 − 本计划停灯”的估算残余、
